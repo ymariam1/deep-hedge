@@ -4,6 +4,7 @@ against standard baselines.
 
 Baselines implemented
 ---------------------
+0. **Naked Option (hold without hedging)**
 1. **Black-Scholes Delta Hedge (analytic)**
 2. **Deep Hedger - MLP (no band)**
 3. **No-Transaction Band Network (NTBN)**
@@ -29,18 +30,13 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-from dataclasses import dataclass
-from typing import List
-import math
 import sys
-import os
 
 # Add the project root to the Python path so we can import from src
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.cm import get_cmap
 import torch
 
 from src.market.underlying.gbm_stock import BrownianStock
@@ -52,296 +48,14 @@ from scripts.cvar import CVaRLoss
 # Local NTBN implementation (ntbtn.py in repo root)
 from scripts.ntbtn import NoTransactionBandNet
 
-# PPO imports
-try:
-    from stable_baselines3 import PPO
-    STABLE_BASELINES_AVAILABLE = True
-except ImportError:
-    STABLE_BASELINES_AVAILABLE = False
-    print("Warning: stable-baselines3 not available. PPO model will be skipped.")
+# Import all utility functions and classes from the helper module
+from scripts.baseline_utils import (
+    NakedOption, PPOBandNet, MLPWrapper, HedgeStats,
+    organize_results_by_name, debug_csv_values, 
+    calculate_confidence_intervals, calculate_kelly_ratio, calculate_sharpe_ratio,
+    evaluate_hedger, STABLE_BASELINES_AVAILABLE
+)
 
-
-# -----------------------------------------------------------------------------
-# PPO Wrapper for RL-based hedging
-# -----------------------------------------------------------------------------
-
-class PPOBandNet(torch.nn.Module):
-    """Wrapper for trained PPO model that implements no-transaction band hedging."""
-    
-    def __init__(self, derivative, model_path: str = None):
-        super().__init__()
-        self.derivative = derivative
-        self.model_path = model_path
-        self.ppo_model = None
-        self.cost = 1e-4
-        self.prev_hedge = 0.0
-        
-        # Load the trained PPO model
-        if model_path and STABLE_BASELINES_AVAILABLE:
-            try:
-                self.ppo_model = PPO.load(model_path)
-                print(f"Loaded PPO model from {model_path}")
-            except Exception as e:
-                print(f"Warning: Could not load PPO model from {model_path}: {e}")
-                self.ppo_model = None
-        else:
-            # Try to find the most recent model
-            self._find_latest_model()
-    
-    def _find_latest_model(self):
-        """Find the most recent trained PPO model."""
-        try:
-            results_dir = pathlib.Path("rl/results/ppo_models")
-            if results_dir.exists():
-                model_dirs = [d for d in results_dir.iterdir() if d.is_dir()]
-                if model_dirs:
-                    latest_model_dir = max(model_dirs, key=lambda x: x.stat().st_mtime)
-                    model_path = latest_model_dir / "ppo_band_final.zip"
-                    if model_path.exists():
-                        self.ppo_model = PPO.load(str(model_path))
-                        print(f"Auto-loaded PPO model from {model_path}")
-                    else:
-                        print("PPO model file not found")
-        except Exception as e:
-            print(f"Could not auto-load PPO model: {e}")
-    
-    def inputs(self):
-        """Return the same inputs as BlackScholes model for compatibility."""
-        bs_model = BlackScholes(self.derivative)
-        return bs_model.inputs()
-    
-    def _normal_cdf(self, x):
-        """Standard normal cumulative distribution function"""
-        return 0.5 * (1 + math.erf(x / np.sqrt(2)))
-    
-    def _calculate_bs_delta(self, spot, time_to_maturity):
-        """Calculate Black-Scholes delta for the option."""
-        if time_to_maturity <= 0:
-            # At expiry
-            if hasattr(self.derivative, 'call') and self.derivative.call:
-                return 1.0 if spot > self.derivative.strike else 0.0
-            else:
-                return -1.0 if spot < self.derivative.strike else 0.0
-        
-        # Standard BS delta calculation
-        volatility = 0.2  # Should match the training environment
-        strike = self.derivative.strike
-        
-        d1 = (np.log(spot / strike) + (0.5 * volatility**2) * time_to_maturity) / (volatility * np.sqrt(time_to_maturity))
-        
-        if hasattr(self.derivative, 'call') and self.derivative.call:
-            return self._normal_cdf(d1)
-        else:
-            return self._normal_cdf(d1) - 1.0
-    
-    def forward(self, input_tensor):
-        """
-        Forward pass that computes hedge ratios using PPO policy.
-        
-        Args:
-            input_tensor: Tensor with shape (n_paths, n_steps, n_features)
-                         Features: [log_moneyness, time_to_maturity, volatility, ...]
-        
-        Returns:
-            hedge_ratios: Tensor with shape (n_paths, n_steps, 1)
-        """
-        if self.ppo_model is None:
-            # Fallback to BS delta if no PPO model available
-            log_moneyness = input_tensor[..., 0]
-            time_to_maturity = input_tensor[..., 1]
-            spot = torch.exp(log_moneyness) * self.derivative.strike
-            
-            # Calculate BS delta for each point
-            hedge_ratios = torch.zeros_like(input_tensor[..., :1])
-            for i in range(input_tensor.shape[0]):
-                for j in range(input_tensor.shape[1]):
-                    s = spot[i, j].item()
-                    tau = time_to_maturity[i, j].item()
-                    delta = self._calculate_bs_delta(s, tau)
-                    hedge_ratios[i, j, 0] = delta
-            
-            return hedge_ratios
-        
-        # Use PPO model for hedging decisions
-        batch_size, n_steps, n_features = input_tensor.shape
-        hedge_ratios = torch.zeros(batch_size, n_steps, 1)
-        
-        for path_idx in range(batch_size):
-            self.prev_hedge = 0.0  # Reset for each path
-            
-            for step_idx in range(n_steps):
-                # Extract current state
-                log_moneyness = input_tensor[path_idx, step_idx, 0].item()
-                time_to_maturity = input_tensor[path_idx, step_idx, 1].item()
-                volatility = input_tensor[path_idx, step_idx, 2].item() if n_features > 2 else 0.2
-                
-                # Current spot price
-                spot = np.exp(log_moneyness) * self.derivative.strike
-                
-                # Calculate BS delta
-                bs_delta = self._calculate_bs_delta(spot, time_to_maturity)
-                
-                # Create observation for PPO (matching training environment format)
-                # [log_moneyness, time_to_maturity, volatility, prev_hedge, cum_pnl, trade_count]
-                obs = np.array([
-                    log_moneyness,
-                    time_to_maturity, 
-                    volatility,
-                    self.prev_hedge,
-                    0.0,  # cum_pnl (not used for action selection)
-                    0.0   # trade_count (not used for action selection)
-                ], dtype=np.float32)
-                
-                # Get action from PPO policy
-                try:
-                    action, _ = self.ppo_model.predict(obs, deterministic=True)
-                    
-                    # Apply softplus to get band widths
-                    widths = torch.nn.functional.softplus(torch.tensor(action)).numpy()
-                    
-                    # Apply no-transaction band logic
-                    band_min = bs_delta - widths[0]
-                    band_max = bs_delta + widths[1]
-                    
-                    # Clamp current hedge to band
-                    new_hedge = np.clip(self.prev_hedge, band_min, band_max)
-                    self.prev_hedge = new_hedge
-                    
-                    hedge_ratios[path_idx, step_idx, 0] = new_hedge
-                    
-                except Exception as e:
-                    print(f"PPO prediction error: {e}, using BS delta")
-                    hedge_ratios[path_idx, step_idx, 0] = bs_delta
-                    self.prev_hedge = bs_delta
-        
-        return hedge_ratios
-
-
-# -----------------------------------------------------------------------------
-# Helper dataclass to aggregate results
-# -----------------------------------------------------------------------------
-
-@dataclass
-class HedgeStats:
-    name: str
-    price: float
-    pnl_mean: float
-    pnl_std: float
-    trades_mean: float
-    abs_error_mean: float
-    cvar5: float = 0.0  # Conditional Value at Risk (5%)
-
-    def to_dict(self):
-        """Ensure all values are native Python types, not tensors or numpy arrays"""
-        def to_python_type(val):
-            if hasattr(val, 'item'):
-                return val.item()  # For PyTorch tensors
-            elif hasattr(val, 'tolist'):
-                return val.tolist()  # For numpy arrays
-            return val  # Already a Python type
-            
-        return {
-            "model": str(self.name),
-            "price": to_python_type(self.price),
-            "pnl_mean": to_python_type(self.pnl_mean),
-            "pnl_std": to_python_type(self.pnl_std),
-            "trades_mean": to_python_type(self.trades_mean),
-            "abs_error_mean": to_python_type(self.abs_error_mean),
-            "cvar5": to_python_type(self.cvar5),
-        }
-
-
-# -----------------------------------------------------------------------------
-# Core evaluation function
-# -----------------------------------------------------------------------------
-
-def organize_results_by_name(stats: List[HedgeStats], results: List[dict]) -> dict:
-    """Organize results by model name for easier plotting and analysis.
-    
-    Args:
-        stats (List[HedgeStats]): List of HedgeStats objects containing model names and summary statistics
-        results (List[dict]): List of result dictionaries containing raw data (pnl, nb_trade, error)
-        
-    Returns:
-        dict: Dictionary mapping model names to their complete results
-    """
-    return {
-        stat.name: {
-            "stats": stat,
-            "pnl": result["pnl"],
-            "nb_trade": result["nb_trade"],
-            "error": result["error"]
-        }
-        for stat, result in zip(stats, results)
-    }
-
-def evaluate_hedger(model: torch.nn.Module, derivative, n_paths: int, n_epochs: int, loss: torch.nn.Module = None) -> tuple[HedgeStats, dict]:
-    """Train **and** test a hedger, returning summary statistics.
-
-    A fresh *Hedger* wrapper is created for each model.
-    The function re-trains the model each call - tweak as needed.
-    """
-    hedger = Hedger(model, model.inputs())
-
-    # === TRAIN ===
-    # Skip training if n_epochs is 0 or model has no parameters
-    has_params = any(p.requires_grad for p in model.parameters())
-    if n_epochs > 0 and has_params:
-        hedger.fit(derivative, n_paths=n_paths, n_epochs=n_epochs, verbose=False)
-
-    # === TEST / MONTE‑CARLO ===
-    derivative.simulate(n_paths=n_paths)
-    pl = hedger.compute_pl(derivative)  # Get P&L
-    hedge = hedger.compute_hedge(derivative)  # Get hedge ratios
-
-    # Calculate number of trades by looking at changes in hedge ratios
-    trades = (hedge[..., 1:] != hedge[..., :-1]).sum(dim=-1).sum(dim=-1)
-    # Calculate absolute error
-    abs_error = (pl - derivative.payoff()).abs()
-
-    # Calculate CVaR at 5% level using PyTorch
-    q = torch.quantile(pl, 0.05)
-    cvar5 = pl[pl <= q].mean().item()
-
-    # Get the price as a Python float
-    price = hedger.price(derivative, n_paths=n_paths).item()
-    
-    # Create result dict with detached tensors
-    result = {
-        "pnl": pl.detach(),
-        "nb_trade": trades.detach(),
-        "error": (pl - derivative.payoff()).detach()
-    }
-
-    return HedgeStats(
-        name=model.__class__.__name__,
-        price=price,  # Already converted to item() above
-        pnl_mean=pl.mean().item(),
-        pnl_std=pl.std().item(),
-        trades_mean=trades.float().mean().item(),
-        abs_error_mean=abs_error.mean().item(),
-        cvar5=cvar5,  # Already converted to item() above
-    ), result
-
-
-# -----------------------------------------------------------------------------
-# Main script
-# -----------------------------------------------------------------------------
-
-def debug_csv_values(stats: List[HedgeStats]) -> None:
-    """Print debug information for CSV values."""
-    for i, s in enumerate(stats):
-        print(f"\nModel {i+1}: {s.name}")
-        print(f"  price: {type(s.price)} = {s.price}")
-        print(f"  pnl_mean: {type(s.pnl_mean)} = {s.pnl_mean}")
-        print(f"  pnl_std: {type(s.pnl_std)} = {s.pnl_std}")
-        print(f"  trades_mean: {type(s.trades_mean)} = {s.trades_mean}")
-        print(f"  abs_error_mean: {type(s.abs_error_mean)} = {s.abs_error_mean}")
-        if hasattr(s, 'cvar5'):
-            print(f"  cvar5: {type(s.cvar5)} = {s.cvar5}")
-        else:
-            print("  cvar5: Not available")
-            
 
 def main():
     parser = argparse.ArgumentParser(description="Deep-hedging baseline comparison")
@@ -361,6 +75,13 @@ def main():
     stats: list[HedgeStats] = []
     results: list[dict] = []
 
+    # 0 Naked Option - simply hold the option (baseline)
+    naked_model = NakedOption(derivative)
+    stat, result = evaluate_hedger(naked_model, derivative, args.paths, n_epochs=0)
+    stat.name = "NakedOption"  # Override the class name for better display
+    stats.append(stat)
+    results.append(result)
+
     # 1 Black‑Scholes analytic hedge (no learning)
     bs_model = BlackScholes(derivative)
     stat, result = evaluate_hedger(bs_model, derivative, args.paths, n_epochs=0)
@@ -368,20 +89,7 @@ def main():
     results.append(result)
 
     # 2 Deep hedger – vanilla MLP (no band)
-    # Create a wrapper to ensure MLP has inputs method matching BS model
-    class MLPWrapper(torch.nn.Module):
-        def __init__(self, n_units=(64, 64)):
-            super().__init__()
-            self.mlp = MultiLayerPerceptron(out_features=1, n_units=n_units, n_layers=len(n_units))
-            
-        def forward(self, x):
-            return self.mlp(x)
-            
-        def inputs(self):
-            # Use same inputs as BlackScholes
-            return bs_model.inputs()
-    
-    mlp_model = MLPWrapper()
+    mlp_model = MLPWrapper(derivative)
     stat, result = evaluate_hedger(mlp_model, derivative, args.paths, args.epochs)
     # Update name to be more descriptive
     stat = HedgeStats(
@@ -392,6 +100,8 @@ def main():
         trades_mean=stat.trades_mean,
         abs_error_mean=stat.abs_error_mean,
         cvar5=stat.cvar5,
+        kelly_ratio=stat.kelly_ratio,
+        sharpe_ratio=stat.sharpe_ratio,
     )
     stats.append(stat)
     results.append(result)
@@ -443,11 +153,11 @@ def main():
     # --- Display summary table ---
     print(f"\n=== Comparison Results ({len(stats)} models) ===")
     # Print header
-    print(f"{'Model':<20} {'Price':<10} {'PnL Mean':<10} {'PnL Std':<10} {'Trades Mean':<12} {'Error Mean':<12} {'CVaR 5%':<10}")
-    print("-" * 90)
+    print(f"{'Model':<20} {'Price':<10} {'PnL Mean':<10} {'PnL Std':<10} {'Trades Mean':<12} {'Error Mean':<12} {'CVaR 5%':<10} {'Kelly':<10} {'Sharpe':<10}")
+    print("-" * 110)
     # Print rows
     for s in stats:
-        print(f"{s.name:<20} {s.price:<10.6f} {s.pnl_mean:<10.6f} {s.pnl_std:<10.6f} {s.trades_mean:<12.6f} {s.abs_error_mean:<12.6f} {s.cvar5:<10.6f}")
+        print(f"{s.name:<20} {s.price:<10.6f} {s.pnl_mean:<10.6f} {s.pnl_std:<10.6f} {s.trades_mean:<12.6f} {s.abs_error_mean:<12.6f} {s.cvar5:<10.6f} {s.kelly_ratio:<10.6f} {s.sharpe_ratio:<10.6f}")
 
     # Highlight PPO if included
     ppo_included = any("PPO" in s.name for s in stats)
@@ -473,7 +183,7 @@ def main():
             # Open the file and write directly
             with open(csv_path, 'w') as f:
                 # Write header
-                f.write("model,price,pnl_mean,pnl_std,trades_mean,abs_error_mean,cvar5\n")
+                f.write("model,price,pnl_mean,pnl_std,trades_mean,abs_error_mean,cvar5,kelly_ratio,sharpe_ratio\n")
                 
                 # Write each row
                 for s in stats:
@@ -486,13 +196,15 @@ def main():
                         trades_mean = str(float(s.trades_mean) if hasattr(s.trades_mean, 'item') else float(s.trades_mean))
                         abs_error_mean = str(float(s.abs_error_mean) if hasattr(s.abs_error_mean, 'item') else float(s.abs_error_mean))
                         cvar5 = str(float(s.cvar5) if hasattr(s, 'cvar5') and s.cvar5 is not None else 0.0)
+                        kelly_ratio = str(float(s.kelly_ratio) if hasattr(s, 'kelly_ratio') and s.kelly_ratio is not None else 0.0)
+                        sharpe_ratio = str(float(s.sharpe_ratio) if hasattr(s, 'sharpe_ratio') and s.sharpe_ratio is not None else 0.0)
                         
                         # Write the row
-                        f.write(f"{name},{price},{pnl_mean},{pnl_std},{trades_mean},{abs_error_mean},{cvar5}\n")
+                        f.write(f"{name},{price},{pnl_mean},{pnl_std},{trades_mean},{abs_error_mean},{cvar5},{kelly_ratio},{sharpe_ratio}\n")
                     except Exception as row_err:
                         print(f"Warning: Could not write row for {s.name}: {row_err}")
                         # Write a row with placeholder values
-                        f.write(f"{s.name},0.0,0.0,0.0,0.0,0.0,0.0\n")
+                        f.write(f"{s.name},0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0\n")
             
             print(f"CSV saved successfully to {csv_path}")
             
@@ -531,27 +243,104 @@ def main():
         try:
             fig, ax = plt.subplots(2, 2, figsize=(12, 9)); fig.suptitle("Model Performance Comparison")
             names = [s.name for s in stats]
-            # Convert all metrics to plain Python floats
-            metrics = {
-                "Initial Price": [float(s.price) for s in stats],
-                "Average P&L": [float(s.pnl_mean) for s in stats],
-                "P&L σ": [float(s.pnl_std) for s in stats],
-                "Avg Trades": [float(s.trades_mean) for s in stats],
+            
+            # Prepare raw data for confidence interval calculations
+            # For metrics that don't have direct raw data, we'll use bootstrap from PnL
+            pnl_data_list = []
+            trade_data_list = []
+            error_data_list = []
+            
+            for s in stats:
+                model_results = result_by_name[s.name]
+                pnl_data_list.append(model_results["pnl"])
+                trade_data_list.append(model_results["nb_trade"])
+                error_data_list.append(model_results["error"])
+            
+            # Calculate confidence intervals for each metric type
+            pnl_mean_ci = calculate_confidence_intervals(pnl_data_list)
+            trade_mean_ci = calculate_confidence_intervals(trade_data_list)
+            error_mean_ci = calculate_confidence_intervals(error_data_list)
+            
+            # For price and PnL std, we'll use bootstrap sampling from PnL data
+            price_ci = []
+            pnl_std_ci = []
+            
+            for i, s in enumerate(stats):
+                model_results = result_by_name[s.name]
+                pnl_data = model_results["pnl"]
+                
+                # Convert to numpy
+                if hasattr(pnl_data, 'cpu'):
+                    pnl_np = pnl_data.cpu().numpy()
+                elif hasattr(pnl_data, 'numpy'):
+                    pnl_np = pnl_data.numpy()
+                else:
+                    pnl_np = np.array(pnl_data)
+                
+                # For price, we'll use a small dummy error since it's essentially deterministic
+                # In practice, the "price" is the mean P&L, so we can use the P&L mean CI
+                price_ci.append(pnl_mean_ci[i])
+                
+                # Bootstrap for PnL std confidence interval
+                n_bootstrap = 1000
+                bootstrap_stds = []
+                
+                for _ in range(n_bootstrap):
+                    bootstrap_sample = np.random.choice(pnl_np, size=len(pnl_np), replace=True)
+                    bootstrap_stds.append(np.std(bootstrap_sample))
+                
+                # Calculate confidence intervals for standard deviation
+                std_mean = np.mean(bootstrap_stds)
+                std_margin = np.percentile(bootstrap_stds, 97.5) - std_mean
+                pnl_std_ci.append((std_mean, std_margin))
+            
+            # Convert all metrics to plain Python floats and prepare error bars
+            metrics_data = {
+                "Initial Price": {
+                    "values": [float(s.price) for s in stats],
+                    "errors": [ci[1] for ci in price_ci]
+                },
+                "Average P&L": {
+                    "values": [float(s.pnl_mean) for s in stats],
+                    "errors": [ci[1] for ci in pnl_mean_ci]
+                },
+                "P&L σ": {
+                    "values": [float(s.pnl_std) for s in stats],
+                    "errors": [ci[1] for ci in pnl_std_ci]
+                },
+                "Avg Trades": {
+                    "values": [float(s.trades_mean) for s in stats],
+                    "errors": [ci[1] for ci in trade_mean_ci]
+                },
             }
             
-            # Plot each metric
-            for ax_i, (title, values) in zip(ax.flatten(), metrics.items()):
+            # Plot each metric with error bars
+            for ax_i, (title, metric_data) in zip(ax.flatten(), metrics_data.items()):
                 # Create x positions for the bars
                 x_pos = np.arange(len(names))
-                ax_i.bar(x_pos, values, color=colors)
+                values = metric_data["values"]
+                errors = metric_data["errors"]
+                
+                # Create bars with error bars
+                bars = ax_i.bar(x_pos, values, color=colors, yerr=errors, 
+                               capsize=5, ecolor='black', alpha=0.7)
                 
                 # Set ticks and labels properly to avoid warning
                 ax_i.set_xticks(x_pos)
                 ax_i.set_xticklabels(names, rotation=45, ha="right")
-                ax_i.set_title(title)
+                ax_i.set_title(f"{title} (95% CI)")
                 ax_i.grid(axis='y', alpha=0.3)
+                
+                # Add value labels on bars
+                for i, (bar, value, error) in enumerate(zip(bars, values, errors)):
+                    height = bar.get_height()
+                    ax_i.text(bar.get_x() + bar.get_width()/2., height + error + (max(values) * 0.01),
+                             f'{value:.3f}', ha='center', va='bottom', fontsize=8)
+                             
         except Exception as e:
             print(f"Warning: Could not create metrics comparison plot: {e}")
+            import traceback
+            traceback.print_exc()
         plt.tight_layout(); plt.subplots_adjust(top=0.92)
         plt.savefig(out / "metrics_comparison.png", dpi=150)
 
