@@ -35,30 +35,86 @@ except ImportError:
 # -----------------------------------------------------------------------------
 
 class NakedOption(torch.nn.Module):
-    """Naked option strategy - simply hold the option without hedging."""
+    """Model that simply holds the option without any hedging (baseline)."""
     
     def __init__(self, derivative):
         super().__init__()
         self.derivative = derivative
-        
+    
     def inputs(self):
-        """Return the same inputs as BlackScholes model for compatibility."""
+        # Use same inputs as BlackScholes for compatibility
         bs_model = BlackScholes(self.derivative)
         return bs_model.inputs()
     
     def forward(self, input_tensor):
-        """
-        Forward pass that returns zero hedge ratios (no hedging).
-        
-        Args:
-            input_tensor: Tensor with shape (n_paths, n_steps, n_features)
-        
-        Returns:
-            hedge_ratios: Tensor of zeros with shape (n_paths, n_steps, 1)
-        """
-        batch_size, n_steps, n_features = input_tensor.shape
-        # Return zeros - no hedging at all
+        # Return zero hedge ratios for all paths and timesteps
+        batch_size, n_steps, _ = input_tensor.shape
         return torch.zeros(batch_size, n_steps, 1)
+
+
+class SimpleBandWrapper(torch.nn.Module):
+    """Wrapper that applies a simple no-transaction band to any hedging model."""
+    
+    def __init__(self, base_model, band_width=0.02):
+        super().__init__()
+        self.base_model = base_model
+        self.band_width = band_width
+        self.derivative = base_model.derivative if hasattr(base_model, 'derivative') else None
+    
+    def inputs(self):
+        return self.base_model.inputs()
+    
+    def parameters(self):
+        """Expose parameters from the base model for training."""
+        return self.base_model.parameters()
+    
+    def named_parameters(self, prefix='', recurse=True):
+        """Expose named parameters from the base model for training."""
+        return self.base_model.named_parameters(prefix=prefix, recurse=recurse)
+    
+    def train(self, mode=True):
+        """Set training mode for the base model."""
+        super().train(mode)
+        self.base_model.train(mode)
+        return self
+    
+    def eval(self):
+        """Set evaluation mode for the base model."""
+        super().eval()
+        self.base_model.eval()
+        return self
+    
+    def forward(self, input_tensor):
+        """Apply no-transaction band logic to the base model's hedge ratios."""
+        # Get target hedge ratios from the base model
+        target_hedge = self.base_model.forward(input_tensor)
+        
+        batch_size, n_steps, _ = target_hedge.shape
+        actual_hedge = torch.zeros_like(target_hedge)
+        
+        # Apply band logic for each path
+        for batch_idx in range(batch_size):
+            prev_hedge = 0.0  # Start with no position
+            
+            for step_idx in range(n_steps):
+                target = target_hedge[batch_idx, step_idx, 0].item()
+                
+                # Define band around current position
+                band_min = prev_hedge - self.band_width
+                band_max = prev_hedge + self.band_width
+                
+                # Only trade if target is outside the band
+                if target < band_min:
+                    new_hedge = band_min
+                elif target > band_max:
+                    new_hedge = band_max
+                else:
+                    new_hedge = prev_hedge  # Stay in current position
+                
+                actual_hedge[batch_idx, step_idx, 0] = new_hedge
+                prev_hedge = new_hedge
+        
+        return actual_hedge
 
 
 class PPOBandNet(torch.nn.Module):
@@ -85,19 +141,36 @@ class PPOBandNet(torch.nn.Module):
             self._find_latest_model()
     
     def _find_latest_model(self):
-        """Find the most recent trained PPO model."""
+        """Find the most recent trained PPO model, preferring improved models."""
         try:
             results_dir = pathlib.Path("rl/results/ppo_models")
             if results_dir.exists():
                 model_dirs = [d for d in results_dir.iterdir() if d.is_dir()]
                 if model_dirs:
-                    latest_model_dir = max(model_dirs, key=lambda x: x.stat().st_mtime)
-                    model_path = latest_model_dir / "ppo_band_final.zip"
-                    if model_path.exists():
-                        self.ppo_model = PPO.load(str(model_path))
-                        print(f"Auto-loaded PPO model from {model_path}")
-                    else:
-                        print("PPO model file not found")
+                    # Prioritize improved models
+                    improved_dirs = [d for d in model_dirs if "improved" in d.name.lower()]
+                    regular_dirs = [d for d in model_dirs if "improved" not in d.name.lower()]
+                    
+                    # Use improved models if available, otherwise fall back to regular
+                    candidate_dirs = improved_dirs if improved_dirs else regular_dirs
+                    
+                    latest_model_dir = max(candidate_dirs, key=lambda x: x.stat().st_mtime)
+                    
+                    # Try improved model file name first, then regular
+                    model_files = [
+                        "ppo_band_improved_final.zip",
+                        "ppo_band_final.zip"
+                    ]
+                    
+                    for model_filename in model_files:
+                        model_path = latest_model_dir / model_filename
+                        if model_path.exists():
+                            self.ppo_model = PPO.load(str(model_path))
+                            model_type = "improved" if "improved" in model_filename else "regular"
+                            print(f"Auto-loaded {model_type} PPO model from {model_path}")
+                            return
+                    
+                    print("PPO model file not found")
         except Exception as e:
             print(f"Could not auto-load PPO model: {e}")
     
@@ -454,7 +527,15 @@ def evaluate_hedger(model: torch.nn.Module, derivative, n_paths: int, n_epochs: 
     hedge = hedger.compute_hedge(derivative)  # Get hedge ratios
 
     # Calculate number of trades by looking at changes in hedge ratios
-    trades = (hedge[..., 1:] != hedge[..., :-1]).sum(dim=-1).sum(dim=-1)
+    # Use a small threshold to avoid counting tiny floating-point differences as trades
+    threshold = 1e-6
+    hedge_changes = torch.abs(hedge[..., 1:] - hedge[..., :-1]) > threshold
+    trades = hedge_changes.sum(dim=-1).sum(dim=-1)
+    
+    # For band-based models (like PPO), this naturally gives fewer trades
+    # For delta hedging models, this gives trades at every timestep
+    # This is the correct and fair comparison!
+    
     # Calculate absolute error
     abs_error = (pl - derivative.payoff()).abs()
 

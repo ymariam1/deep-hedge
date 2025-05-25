@@ -50,7 +50,7 @@ from scripts.ntbtn import NoTransactionBandNet
 
 # Import all utility functions and classes from the helper module
 from scripts.baseline_utils import (
-    NakedOption, PPOBandNet, MLPWrapper, HedgeStats,
+    NakedOption, PPOBandNet, MLPWrapper, HedgeStats, SimpleBandWrapper,
     organize_results_by_name, debug_csv_values, 
     calculate_confidence_intervals, calculate_kelly_ratio, calculate_sharpe_ratio,
     evaluate_hedger, STABLE_BASELINES_AVAILABLE
@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--save", action="store_true", help="Save csv and png plot")
     parser.add_argument("--debug", action="store_true", help="Print debug information")
     parser.add_argument("--ppo-model", type=str, default=None, help="Path to trained PPO model (optional)")
+    parser.add_argument("--normalize-trades", action="store_true", help="Apply simple bands to all models for fair trade comparison")
+    parser.add_argument("--band-width", type=float, default=0.02, help="Band width for trade normalization (default: 0.02)")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -75,6 +77,16 @@ def main():
     stats: list[HedgeStats] = []
     results: list[dict] = []
 
+    print(f"=== Baseline Comparison Setup ===")
+    print(f"Paths: {args.paths:,}")
+    print(f"Epochs: {args.epochs}")
+    if args.normalize_trades:
+        print(f"Trade normalization: ON (band width: {args.band_width})")
+        print("All models will use band-based trading for fair comparison")
+    else:
+        print("Trade normalization: OFF (models use their natural trading strategies)")
+    print()
+
     # 0 Naked Option - simply hold the option (baseline)
     naked_model = NakedOption(derivative)
     stat, result = evaluate_hedger(naked_model, derivative, args.paths, n_epochs=0)
@@ -84,12 +96,18 @@ def main():
 
     # 1 Black‑Scholes analytic hedge (no learning)
     bs_model = BlackScholes(derivative)
+    if args.normalize_trades:
+        # Wrap with a simple band to reduce trades
+        bs_model = SimpleBandWrapper(bs_model, band_width=args.band_width)
     stat, result = evaluate_hedger(bs_model, derivative, args.paths, n_epochs=0)
     stats.append(stat)
     results.append(result)
 
     # 2 Deep hedger – vanilla MLP (no band)
     mlp_model = MLPWrapper(derivative)
+    if args.normalize_trades:
+        # Wrap with a simple band to reduce trades
+        mlp_model = SimpleBandWrapper(mlp_model, band_width=args.band_width)
     stat, result = evaluate_hedger(mlp_model, derivative, args.paths, args.epochs)
     # Update name to be more descriptive
     stat = HedgeStats(
@@ -108,18 +126,21 @@ def main():
 
     # 3 No‑Transaction Band Network
     ntbn = NoTransactionBandNet(derivative)
+    # NTBN already has bands built-in, no need to wrap
     stat, result = evaluate_hedger(ntbn, derivative, args.paths, args.epochs)
     stats.append(stat)
     results.append(result)
 
     # 4 Softplus Band Network
     sp_ntbn = SoftplusBandNet(derivative)
+    # SoftplusBandNet already has bands built-in, no need to wrap
     stat, result = evaluate_hedger(sp_ntbn, derivative, args.paths, args.epochs)
     stats.append(stat)
     results.append(result)
 
     # 5 Softplus NTBN + CVaR
     sp_ntbn_cvar = SoftplusBandNet(derivative)
+    # SoftplusBandNet already has bands built-in, no need to wrap
     stat, result = evaluate_hedger(sp_ntbn_cvar, derivative, args.paths, args.epochs, loss=CVaRLoss(alpha=0.05, cost_weight=1e-4))
     stat.name = "SoftplusBandNet_CVaR"
     stats.append(stat)
@@ -132,6 +153,7 @@ def main():
             ppo_model = PPOBandNet(derivative, model_path=args.ppo_model)
             if ppo_model.ppo_model is not None:  # Only evaluate if model was loaded successfully
                 print("Evaluating PPO model...")
+                # PPO already has bands built-in, no need to wrap
                 stat, result = evaluate_hedger(ppo_model, derivative, args.paths, n_epochs=0)  # No training needed
                 stat.name = "PPO_BandNet"
                 stats.append(stat)
@@ -215,9 +237,15 @@ def main():
         try:
             cmap = plt.get_cmap('tab10')
             colors = cmap(np.linspace(0, 1, len(stats)))  # Auto-adapt colors to number of models (including PPO)
-            plt.figure(figsize=(10, 6))
-            for i, s in enumerate(stats):
-                # Safely convert to numpy array with error handling
+            
+            # Create two histogram plots: raw counts and normalized density
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # First collect all P&L data to determine common range
+            all_pnl_data = []
+            model_pnl_data = {}
+            
+            for s in stats:
                 try:
                     pnl = result_by_name[s.name]["pnl"]
                     # Handle different tensor types
@@ -228,16 +256,58 @@ def main():
                     else:
                         pnl_data = np.array(pnl)
                     
-                    plt.hist(pnl_data, bins=60, histtype="step", lw=2, color=colors[i], label=s.name)
+                    model_pnl_data[s.name] = pnl_data
+                    all_pnl_data.extend(pnl_data)
                 except Exception as e:
-                    print(f"Warning: Could not plot histogram for {s.name}: {e}")
-                    
-            plt.axvline(0, ls="--", c="k", alpha=0.4)
-            plt.xlabel("Terminal P&L"); plt.ylabel("Frequency"); plt.legend(); plt.tight_layout()
+                    print(f"Warning: Could not collect data for {s.name}: {e}")
+            
+            # Determine common range and bins
+            if all_pnl_data:
+                pnl_min, pnl_max = min(all_pnl_data), max(all_pnl_data)
+                # Add some padding to the range
+                pnl_range = pnl_max - pnl_min
+                common_range = (pnl_min - 0.05 * pnl_range, pnl_max + 0.05 * pnl_range)
+                bins = 60
+            else:
+                common_range = (-0.2, 0.2)
+                bins = 60
+            
+            # Plot 1: Raw frequency counts (with common range)
+            for i, s in enumerate(stats):
+                if s.name in model_pnl_data:
+                    pnl_data = model_pnl_data[s.name]
+                    ax1.hist(pnl_data, bins=bins, range=common_range, histtype="step", 
+                            lw=2, color=colors[i], label=s.name)
+            
+            ax1.axvline(0, ls="--", c="k", alpha=0.4)
+            ax1.set_xlabel("Terminal P&L")
+            ax1.set_ylabel("Frequency")
+            ax1.set_title("P&L Distribution (Raw Counts)")
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Plot 2: Normalized density (eliminates scale differences)
+            for i, s in enumerate(stats):
+                if s.name in model_pnl_data:
+                    pnl_data = model_pnl_data[s.name]
+                    ax2.hist(pnl_data, bins=bins, range=common_range, histtype="step", 
+                            lw=2, color=colors[i], label=s.name, density=True)
+            
+            ax2.axvline(0, ls="--", c="k", alpha=0.4)
+            ax2.set_xlabel("Terminal P&L")
+            ax2.set_ylabel("Density")
+            ax2.set_title("P&L Distribution (Normalized Density)")
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
             plt.savefig(out / "pnl_hist.png", dpi=150)
-            print(f"Saved P&L histogram with {len(stats)} models")
+            print(f"Saved improved P&L histogram with {len(stats)} models")
+            print("Note: Fixed histogram binning to use common range and added density normalization")
         except Exception as e:
             print(f"Warning: Could not create histogram plot: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Metric bar charts (Price, Mean P&L, σ, Trades) - includes all models
         try:

@@ -17,6 +17,10 @@ class HedgingEnv(gym.Env):
         self.cost = cost
         self.shortfall_thr = shortfall_thr
         self.trade_count = 0
+        
+        # Track P&L history for variance calculation (for fat tail prevention)
+        self.pnl_history = []
+        self.max_history_size = 1000  # Keep last 1000 episodes for variance calculation
 
         # Action: 2 real numbers → any ℝ; later we softplus
         self.action_space = spaces.Box(low=-5., high=5., shape=(2,), dtype=np.float32)
@@ -130,13 +134,34 @@ class HedgingEnv(gym.Env):
                     payoff = 0.0
             
             final_pnl = self.cum_pnl - payoff
-            # shortfall loss reward - penalize both shortfall and excessive trading
-            shortfall_penalty = -max(0.0, self.shortfall_thr - final_pnl)
             
-            # Add a small penalty for excessive trading (optional - you can tune this)
-            trade_penalty = 5e-5 * self.trade_count  # Small penalty per trade
+            # Store P&L in history for variance tracking
+            self.pnl_history.append(final_pnl)
+            if len(self.pnl_history) > self.max_history_size:
+                self.pnl_history.pop(0)  # Remove oldest entry
             
-            reward = shortfall_penalty + trade_penalty
+            # Modified reward function to prevent gambling for excessive gains
+            # Cap the reward at 0 if final P&L > -10% (good hedging outcome)
+            if final_pnl > self.shortfall_thr:
+                # Good hedging - no additional reward to prevent gambling
+                shortfall_reward = 0.0
+            else:
+                # Poor hedging - penalize the shortfall
+                shortfall_penalty = -max(0.0, self.shortfall_thr - final_pnl)
+                shortfall_reward = shortfall_penalty
+            
+            # Add a penalty for excessive trading to encourage efficiency
+            trade_penalty = -1e-4 * self.trade_count  # Small penalty per trade
+            
+            # Add variance penalty to discourage fat tails (only if we have enough history)
+            variance_penalty = 0.0
+            if len(self.pnl_history) >= 100:  # Need sufficient history
+                pnl_variance = np.var(self.pnl_history)
+                # Penalize high variance strategies (encourages consistent hedging)
+                variance_penalty = -1e-3 * max(0, pnl_variance - 0.01)  # Penalty if variance > 1%
+            
+            # Combine all reward components
+            reward = shortfall_reward + trade_penalty + variance_penalty
         else:
             # Optional: Small intermediate penalty for trading costs
             reward = -self.cost * abs(trade) * 0.1

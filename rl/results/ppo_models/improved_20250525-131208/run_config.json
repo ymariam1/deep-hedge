@@ -1,0 +1,15 @@
+{
+  "timesteps": 10000000,
+  "steps": 250,
+  "shortfall": -0.1,
+  "cost": 0.0001,
+  "lr": 0.0003,
+  "seed": 42,
+  "tag": "improved",
+  "model_path": "rl/results/ppo_models/improved_20250525-131208/ppo_band_improved_final.zip",
+  "improvements": [
+    "Reward capped at 0 when P&L > shortfall threshold",
+    "Variance penalty to discourage fat tails",
+    "Trade cost penalties maintained"
+  ]
+}
