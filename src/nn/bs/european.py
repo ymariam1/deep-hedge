@@ -1,11 +1,11 @@
 from typing import Optional
+from typing import TYPE_CHECKING
 
 from torch import Tensor
 
 from src._utils.bisect import find_implied_volatility
 from src._utils.doc import _set_attr_and_docstring
 from src._utils.str import _format_float
-from src.market.derivative.european_option import EuropeanOption
 from src.nn.functional import bs_european_delta
 from src.nn.functional import bs_european_gamma
 from src.nn.functional import bs_european_price
@@ -16,6 +16,9 @@ from ._base import BSModuleMixin
 from ._base import acquire_params_from_derivative_0
 from ._base import acquire_params_from_derivative_1
 from .black_scholes import BlackScholesModuleFactory
+
+if TYPE_CHECKING:
+    from src.market.derivative.european_option import EuropeanOption
 
 
 class BSEuropeanOption(BSModuleMixin):
@@ -65,7 +68,7 @@ class BSEuropeanOption(BSModuleMixin):
         self,
         call: bool = True,
         strike: float = 1.0,
-        derivative: Optional[EuropeanOption] = None,
+        derivative: Optional["EuropeanOption"] = None,
     ) -> None:
         super().__init__()
         self.call = call
@@ -73,7 +76,7 @@ class BSEuropeanOption(BSModuleMixin):
         self.derivative = derivative
 
     @classmethod
-    def from_derivative(cls, derivative: EuropeanOption) -> "BSEuropeanOption":
+    def from_derivative(cls, derivative: "EuropeanOption") -> "BSEuropeanOption":
         """Initialize a module from a derivative.
 
         Args:

@@ -4,12 +4,15 @@ from typing import Optional
 from typing import Tuple
 from typing import Union
 from typing import no_type_check
+from typing import TYPE_CHECKING
 
 from torch import Tensor
 from torch.nn import Module
 
 import src.autogreek as autogreek
-from src.market.derivative.european_option import EuropeanOption
+
+if TYPE_CHECKING:
+    from src.market.derivative.european_option import EuropeanOption
 
 
 class BSModuleMixin(Module):
@@ -91,11 +94,7 @@ class BSModuleMixin(Module):
 
 
 def acquire_params_from_derivative_0(
-    derivative: Optional[
-        Union[
-            EuropeanOption
-        ]
-    ],
+    derivative: Optional["EuropeanOption"],
     log_moneyness: Optional[Tensor] = None,
     time_to_maturity: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
@@ -115,11 +114,7 @@ def acquire_params_from_derivative_0(
 
 
 def acquire_params_from_derivative_1(
-    derivative: Optional[
-        Union[
-            EuropeanOption,
-        ]
-    ],
+    derivative: Optional["EuropeanOption"],
     log_moneyness: Optional[Tensor] = None,
     time_to_maturity: Optional[Tensor] = None,
     volatility: Optional[Tensor] = None,

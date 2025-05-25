@@ -1,0 +1,2 @@
+model,price,pnl_mean,pnl_std,cvar5,trades_mean,trades_std,trades_median,trade_costs_mean,abs_error_mean
+PPO_Band,0.0,-0.3137471556675856,0.2162164117019677,-0.7425360256140678,25.42105,15.42387003632681,19.0,4.9477498899076606e-05,0.3137471556675856

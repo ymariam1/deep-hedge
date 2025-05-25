@@ -1,0 +1,10 @@
+{
+  "timesteps": 10000000,
+  "steps": 250,
+  "shortfall": -0.12,
+  "cost": 0.0001,
+  "lr": 0.0003,
+  "seed": 42,
+  "tag": "long_run",
+  "model_path": "rl/results/ppo_models/long_run_20250524-134753/ppo_band_final.zip"
+}
