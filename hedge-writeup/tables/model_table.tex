@@ -1,0 +1,17 @@
+\begin{table}[h]
+  \centering
+  \caption{Model comparison summary.}
+  \begin{tabularx}{\linewidth}{@{}lX@{}}
+    \toprule
+    Model & Description \\
+    \midrule
+    Naked Option & Baseline strategy holding the option without hedging \\
+    Black-Scholes & Classical delta hedging with analytical Greeks \\
+    Deep Hedger & Multilayer perceptron trained to minimize hedging error \\
+    NTBN & No-transaction band network with learned band widths \\
+    Softplus Band & NTBN variant with softplus-constrained positive band widths \\
+    Softplus CVaR & Softplus band network optimized with CVaR loss function \\
+    PPO Band & Reinforcement learning approach with improved reward function \\
+    \bottomrule
+  \end{tabularx}
+\end{table} 

@@ -1,0 +1,30 @@
+\begin{thebibliography}{1}
+
+\bibitem{black1973pricing}
+Fischer Black and Myron Scholes.
+\newblock The pricing of options and corporate liabilities.
+\newblock {\em Journal of Political Economy}, 81(3):637--654, 1973.
+
+\bibitem{whalley1997optimal}
+A~Elizabeth Whalley and Paul Wilmott.
+\newblock An asymptotic analysis of an optimal hedging model for option pricing
+  with transaction costs.
+\newblock {\em Mathematical Finance}, 7(3):307--324, 1997.
+
+\bibitem{buehler2019deep}
+Hans B{\"u}hler, Lukas Gonon, Josef Teichmann, and Ben Wood.
+\newblock Deep hedging.
+\newblock {\em Quantitative Finance}, 19(8):1271--1291, 2019.
+
+\bibitem{imaki2021no}
+Masanori Imaki, Kei Nakagawa, and Yusuke Uchida.
+\newblock No-transaction band network: A neural network architecture for
+  efficient deep hedging.
+\newblock {\em Journal of Computational Finance}, 25(4):1--31, 2021.
+
+\bibitem{schulman2017proximal}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+\newblock Proximal policy optimization algorithms.
+\newblock {\em arXiv preprint arXiv:1707.06347}, 2017.
+
+\end{thebibliography}

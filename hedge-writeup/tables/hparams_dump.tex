@@ -1,0 +1,29 @@
+\begin{table}[h]
+  \centering
+  \caption{Hyperparameters used in experiments.}
+  \begin{tabularx}{\linewidth}{@{}lX@{}}
+    \toprule
+    Parameter & Value \\
+    \midrule
+    \multicolumn{2}{@{}l@{}}{\textbf{Market Parameters}} \\
+    Volatility ($\sigma$) & 0.20 \\
+    Drift ($\mu$) & 0.00 \\
+    Transaction cost & \num{1e-4} per share \\
+    Time steps & 250 (daily rebalancing) \\
+    \midrule
+    \multicolumn{2}{@{}l@{}}{\textbf{Neural Network Training}} \\
+    Learning rate & \num{3e-4} \\
+    Training epochs & 100 \\
+    Monte Carlo paths & 20,000 (train and test) \\
+    Network architecture & 2 hidden layers, 64 units each \\
+    \midrule
+    \multicolumn{2}{@{}l@{}}{\textbf{PPO Specific}} \\
+    Total timesteps & \num{2e6} \\
+    Batch size & 256 \\
+    Clip range & 0.2 \\
+    GAE lambda & 1.0 \\
+    Entropy coefficient & 0.01 \\
+    Shortfall threshold & -0.10 \\
+    \bottomrule
+  \end{tabularx}
+\end{table} 
